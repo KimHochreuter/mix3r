@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import argparse
+import resource
 
 COL_DTYPE = dict(SNP='U',
                  N='f4',
@@ -16,6 +17,51 @@ COL_DTYPE = dict(SNP='U',
                  INFO='f4',
                  A1='U',
                  A2='U') # only SNP and trait-specific columns, other columns (CHR, BP, MAF) are taken from template
+
+_PHASE_MEMORY_STARTS_KB = {}
+_LAST_MEMORY_SNAPSHOT_KB = None
+
+
+def _read_proc_status_memory_kb():
+    stats = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmHWM:")):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        stats[parts[0].rstrip(":")] = int(parts[1])
+    except OSError:
+        pass
+    return stats
+
+
+def _get_memory_snapshot_kb():
+    proc_stats = _read_proc_status_memory_kb()
+    current_rss_kb = proc_stats.get("VmRSS")
+    peak_rss_kb = proc_stats.get("VmHWM")
+    fallback_peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if peak_rss_kb is None and fallback_peak_kb:
+        peak_rss_kb = int(fallback_peak_kb)
+    if current_rss_kb is None:
+        current_rss_kb = peak_rss_kb
+    return {"current_rss_kb": current_rss_kb, "peak_rss_kb": peak_rss_kb}
+
+
+def _format_memory_kb(value_kb):
+    if value_kb is None:
+        return "n/a"
+    value_mb = value_kb / 1024.0
+    if value_mb >= 1024.0:
+        return f"{value_mb / 1024.0:.2f} GB"
+    return f"{value_mb:.1f} MB"
+
+
+def _normalize_phase_name(phase):
+    for prefix in ("Start ", "Finished "):
+        if phase.startswith(prefix):
+            return phase[len(prefix):]
+    return phase
 
 
 def parse_args(args):
@@ -28,6 +74,59 @@ def load_config(config_fname):
     with open(config_fname) as f:
         config = json.load(f)
     return config
+
+
+def report_cuda_status():
+    try:
+        available = cuda.is_available()
+        print(f"CUDA available: {available}", flush=True)
+        if available:
+            device = cuda.get_current_device()
+            print(
+                f"CUDA device: {device.name.decode() if isinstance(device.name, bytes) else device.name}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"CUDA probe failed: {exc}", flush=True)
+
+
+def log_phase(phase):
+    global _LAST_MEMORY_SNAPSHOT_KB
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    memory = _get_memory_snapshot_kb()
+    current_rss_kb = memory["current_rss_kb"]
+    peak_rss_kb = memory["peak_rss_kb"]
+    phase_name = _normalize_phase_name(phase)
+
+    delta_parts = []
+    if _LAST_MEMORY_SNAPSHOT_KB is not None and current_rss_kb is not None:
+        delta_kb = current_rss_kb - _LAST_MEMORY_SNAPSHOT_KB
+        delta_sign = "+" if delta_kb >= 0 else "-"
+        delta_parts.append(f"delta={delta_sign}{_format_memory_kb(abs(delta_kb))}")
+
+    if phase.startswith("Start "):
+        _PHASE_MEMORY_STARTS_KB[phase_name] = memory
+    elif phase.startswith("Finished "):
+        start_memory = _PHASE_MEMORY_STARTS_KB.get(phase_name)
+        if start_memory is not None:
+            start_current_kb = start_memory.get("current_rss_kb")
+            start_peak_kb = start_memory.get("peak_rss_kb")
+            if start_current_kb is not None and current_rss_kb is not None:
+                step_delta_kb = current_rss_kb - start_current_kb
+                step_delta_sign = "+" if step_delta_kb >= 0 else "-"
+                delta_parts.append(f"step_delta={step_delta_sign}{_format_memory_kb(abs(step_delta_kb))}")
+            if start_peak_kb is not None and peak_rss_kb is not None:
+                step_peak_kb = peak_rss_kb - start_peak_kb
+                if step_peak_kb >= 0:
+                    delta_parts.append(f"step_peak_increase={_format_memory_kb(step_peak_kb)}")
+
+    memory_parts = [
+        f"rss={_format_memory_kb(current_rss_kb)}",
+        f"peak_rss={_format_memory_kb(peak_rss_kb)}",
+    ]
+    memory_parts.extend(delta_parts)
+    print(f"[{now}] {phase} ({', '.join(memory_parts)})", flush=True)
+    _LAST_MEMORY_SNAPSHOT_KB = current_rss_kb
 
 @nb.njit
 def get_r2_het(r2, r2_idx, het):
@@ -824,7 +923,7 @@ def push_to_bounds(val, lb, rb):
 def optimize_2d_constr(p_1, sb2_1, s02_1, p_2, sb2_2, s02_2, p_3, sb2_3, s02_3,
                        p_12, rho_12, rho0_12, p_13, rho_13, rho0_13, p_23, rho_23, rho0_23,
                        z0_1_vec, z0_2_vec, z0_3_vec, n_1_vec, n_2_vec, n_3_vec,
-                       r2_het_hist, ld_scores, nbin_het_hist):
+                       r2_het_hist, ld_scores, nbin_het_hist, maxiter=4):
     max_rel_dev_p = 0.1
     max_rel_dev_rho = 0.12
     max_rel_dev_rho0 = 0.05
@@ -874,7 +973,7 @@ def optimize_2d_constr(p_1, sb2_1, s02_1, p_2, sb2_2, s02_2, p_3, sb2_3, s02_3,
     print("Parameter bounds:")
     print(bounds)
     res = differential_evolution(obj_func_2d_constr, bounds, args=args_opt, popsize=10,
-                                 polish=False, constraints=constraints, maxiter=4)
+                                 polish=False, constraints=constraints, maxiter=maxiter)
     opt_par = [10**res.x[0], 10**res.x[1], 10**res.x[2], res.x[3], res.x[4], res.x[5], res.x[6], res.x[7], res.x[8]]
     opt_res = dict(x=res.x.tolist(), fun=res.fun.tolist())
     for k in ("success", "status", "message", "nfev", "nit"):
@@ -953,31 +1052,41 @@ def optimize_3d(z0_1_vec, z0_2_vec, z0_3_vec, n_1_vec, n_2_vec, n_3_vec,
 if __name__ == "__main__":
     args = parse_args(sys.argv[1:])
     print(f"Loading config from: {args.config}")
+    report_cuda_status()
     config = load_config(args.config)
 
     nbin_het_hist = config["nbin_het_hist"]
     print(f"{nbin_het_hist} bins in het hist.")
 
+    log_phase("Start loading SNPs and summary statistics")
     snps_df = load_snps(config["template_dir"], config["sumstats"],
             chromosomes=config["snp_filters"]["chromosomes"],
             z_thresh=config["snp_filters"]["z_thresh"],
             info_thresh=config["snp_filters"]["info_thresh"],
             maf_thresh=config["snp_filters"]["maf_thresh"],
             exclude_regions=config["snp_filters"]["exclude_regions"])
+    log_phase("Finished loading SNPs and summary statistics")
 
+    log_phase("Start SNP selection and pruning")
     snps2keep = select_snps(snps_df, snps2keep=None, n_random=config["pruning"]["n_random"], do_pruning=config["pruning"]["do_pruning"],
                         r2_prune_thresh=config["pruning"]["r2_prune_thresh"],
                         template_dir=config["template_dir"],
                         rng_seed=config["pruning"]["rand_prune_seed"])
+    log_phase("Finished SNP selection and pruning")
 
+    log_phase("Start LD data preparation")
     r2_het_hist, z_n_dict, ld_scores = load_opt_data(config["template_dir"], snps_df,
                                       snps2keep=snps2keep, nbin_het_hist=nbin_het_hist)
+    log_phase("Finished LD data preparation")
 
     r2_het_hist_global, z_n_dict_global, ld_scores_global = r2_het_hist, z_n_dict, ld_scores
 
+    log_phase("Start total heterozygosity calculation")
     total_used_het = get_total_het_used(config["template_dir"], snps_df, config["pruning"]["rand_prune_seed"], config["pruning"]["r2_prune_thresh"])
+    log_phase("Finished total heterozygosity calculation")
 
     if True:
+        log_phase("Start univariate optimization 1")
         now = datetime.now()
         start_time = now.strftime("%D-%H:%M:%S")
         opt_out_1 = optimize_1d(z_n_dict["Z_0"], z_n_dict["N_0"], r2_het_hist, ld_scores, nbin_het_hist,
@@ -991,9 +1100,11 @@ if __name__ == "__main__":
         print("End Time =", end_time)
         print("Univariate result 1:")
         print(opt_out_1)
+        log_phase("Finished univariate optimization 1")
 
 
     if True:
+        log_phase("Start univariate optimization 2")
         now = datetime.now()
         start_time = now.strftime("%D-%H:%M:%S")
         opt_out_2 = optimize_1d(z_n_dict["Z_1"], z_n_dict["N_1"], r2_het_hist, ld_scores, nbin_het_hist,
@@ -1007,8 +1118,10 @@ if __name__ == "__main__":
         print("End Time =", end_time)
         print("Univariate result 2:")
         print(opt_out_2)
+        log_phase("Finished univariate optimization 2")
 
     if True:
+        log_phase("Start univariate optimization 3")
         now = datetime.now()
         start_time = now.strftime("%D-%H:%M:%S")
         opt_out_3 = optimize_1d(z_n_dict["Z_2"], z_n_dict["N_2"], r2_het_hist, ld_scores, nbin_het_hist,
@@ -1022,11 +1135,13 @@ if __name__ == "__main__":
         print("End Time =", end_time)
         print("Univariate result 3:")
         print(opt_out_3)
+        log_phase("Finished univariate optimization 3")
 
 
     if True:
         p_1, sb2_1, s02_1 = opt_out_1['opt_par']
         p_2, sb2_2, s02_2 = opt_out_2['opt_par']
+        log_phase("Start bivariate optimization 1 vs 2")
         now = datetime.now()
         start_time = now.strftime("%D-%H:%M:%S")
         opt_out_12 = optimize_2d(p_1, sb2_1, s02_1, z_n_dict["N_0"], z_n_dict["Z_0"], p_2, sb2_2, s02_2,
@@ -1043,6 +1158,7 @@ if __name__ == "__main__":
         print("End Time =", end_time)
         print("Bivariate result 1 vs 2:")
         print(opt_out_12)
+        log_phase("Finished bivariate optimization 1 vs 2")
 
     if True:
         p_1, sb2_1, s02_1 = opt_out_1['opt_par']
@@ -1097,10 +1213,13 @@ if __name__ == "__main__":
             print("Run triple bivariate analysis to make parameters feasible for trivariate.")
             now = datetime.now()
             start_time = now.strftime("%D-%H:%M:%S")
-            opt_out_12_13_23 = optimize_2d_constr(p_1, sb2_1, s02_1, p_2, sb2_2, s02_2, p_3, sb2_3, s02_3,
-                                                   p_12, rho_12, rho0_12, p_13, rho_13, rho0_13, p_23, rho_23, rho0_23,
-                                                   z_n_dict["Z_0"], z_n_dict["Z_1"], z_n_dict["Z_2"], z_n_dict["N_0"], z_n_dict["N_1"], z_n_dict["N_2"],
-                                                   r2_het_hist, ld_scores, nbin_het_hist)
+            opt_out_12_13_23 = optimize_2d_constr(
+                p_1, sb2_1, s02_1, p_2, sb2_2, s02_2, p_3, sb2_3, s02_3,
+                p_12, rho_12, rho0_12, p_13, rho_13, rho0_13, p_23, rho_23, rho0_23,
+                z_n_dict["Z_0"], z_n_dict["Z_1"], z_n_dict["Z_2"], z_n_dict["N_0"], z_n_dict["N_1"], z_n_dict["N_2"],
+                r2_het_hist, ld_scores, nbin_het_hist,
+                config["optimization"].get("maxiter_2d_constr", 20),
+            )
             now = datetime.now()
             end_time = now.strftime("%D-%H:%M:%S")
             print("Start Time =", start_time)

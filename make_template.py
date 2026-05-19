@@ -5,6 +5,8 @@ import os
 from collections import defaultdict
 import sys
 import argparse
+import time
+
 
 example_cmd =  """Example:
 python make_template.py --bim ../data/chr@ --ld ../data/chr@.r2 --frq ../data/chr@.maf --chr 21 22"""
@@ -36,6 +38,45 @@ def read_snps(chromosomes, bim_files, frq_files):
     return snps
 
 
+class ProgressBar:
+    def __init__(self, total, prefix="", width=40, stream=sys.stderr, min_interval=0.1):
+        self.total = max(int(total), 1)
+        self.prefix = prefix
+        self.width = width
+        self.stream = stream
+        self.min_interval = min_interval
+        self.current = 0
+        self._last_line = None
+        self._last_filled = -1
+        self._last_update_time = 0.0
+
+    def update(self, value):
+        self.current = min(int(value), self.total)
+        filled = int(self.width * self.current / self.total)
+        now = time.monotonic()
+        should_render = (
+            self.current >= self.total
+            or filled != self._last_filled
+            or now - self._last_update_time >= self.min_interval
+        )
+        if not should_render:
+            return
+        percent = 100 * self.current / self.total
+        bar = "#" * filled + "-" * (self.width - filled)
+        line = f"\r{self.prefix}[{bar}] {percent:6.2f}% ({self.current}/{self.total})"
+        if line != self._last_line:
+            self.stream.write(line)
+            self.stream.flush()
+            self._last_line = line
+        self._last_filled = filled
+        self._last_update_time = now
+
+    def close(self):
+        self.update(self.total)
+        self.stream.write("\n")
+        self.stream.flush()
+
+
 # https://stackoverflow.com/questions/9619199/best-way-to-preserve-numpy-arrays-on-disk
 def process_ld(ld_files, chrom, snps, out_dir):
     # Args:
@@ -58,6 +99,7 @@ def process_ld(ld_files, chrom, snps, out_dir):
     r2_outf = open(r2_outf_name, 'wb')
     idx_outf = open(idx_outf_name, 'wb')
     ld_n = []
+    progress = ProgressBar(snps_chr.shape[0], prefix=f"chr {chrom} ")
     with gzip.open(ld_files[chrom], 'rt') as f:
         header = f.readline().split()
         ia, ib, ir2 = [header.index(name) for name in ['SNP_A', 'SNP_B', 'R2']]
@@ -66,21 +108,22 @@ def process_ld(ld_files, chrom, snps, out_dir):
             ll = l.split()
             i_sa, i_sb, r2 = snp_idx_dict[ll[ia]], snp_idx_dict[ll[ib]], ll[ir2]
             if i_sa > current_i_sa:
-                process_current(current_i_sa, i_sa, snp_r2_dict, snp_snp_dict, ld_n, idx_outf, r2_outf)
+                process_current(current_i_sa, i_sa, snp_r2_dict, snp_snp_dict, ld_n, idx_outf, r2_outf, progress)
                 current_i_sa = i_sa
             snp_r2_dict[i_sa].append(r2)
             snp_r2_dict[i_sb].append(r2)
             snp_snp_dict[i_sa].append(i_sb)
             snp_snp_dict[i_sb].append(i_sa)
     i_sa = snps_chr.shape[0] 
-    process_current(current_i_sa, i_sa, snp_r2_dict, snp_snp_dict, ld_n, idx_outf, r2_outf)
+    process_current(current_i_sa, i_sa, snp_r2_dict, snp_snp_dict, ld_n, idx_outf, r2_outf, progress)
+    progress.close()
     assert len(snp_snp_dict) == 0
     snps_chr['LD_N'] = np.array(ld_n, dtype='i4')
     snps_chr.to_csv(snp_outf_name, index=False, sep='\t')
     r2_outf.close()
     idx_outf.close()
 
-def process_current(current_i_sa, i_sa, snp_r2_dict, snp_snp_dict, ld_n, idx_outf, r2_outf):
+def process_current(current_i_sa, i_sa, snp_r2_dict, snp_snp_dict, ld_n, idx_outf, r2_outf, progress=None):
     for i_s in range(current_i_sa, i_sa):
         snp_r2_dict[i_s].append(1)
         snp_snp_dict[i_s].append(i_s)
@@ -94,6 +137,8 @@ def process_current(current_i_sa, i_sa, snp_r2_dict, snp_snp_dict, ld_n, idx_out
         r2_outf.write(r2_arr.data)
         del snp_r2_dict[i_s]
         del snp_snp_dict[i_s]
+    if progress is not None:
+        progress.update(i_sa)
 
 
 if __name__ == "__main__":
@@ -105,6 +150,7 @@ if __name__ == "__main__":
 
     snps = read_snps(args.chr, bim_files, frq_files)
     out_dir = args.out
+    os.makedirs(out_dir, exist_ok=True)
     for c in args.chr:
         print(f'Processing chr {c}')
         process_ld(ld_files, c, snps, out_dir)
